@@ -32,7 +32,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 # ===== 路径 =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOMAINS_FILE = os.path.join(BASE_DIR, "domains.json")
-ADMIN_FILE = os.path.join(BASE_DIR, "admin.html")
+
 
 # ===== 环境变量 =====
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -40,7 +40,7 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
 TOKEN_SECRET = os.environ.get("TOKEN_SECRET", "") or base64.b64encode(os.urandom(32)).decode()
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "300"))
 GATE_SECRET = os.environ.get("GATE_SECRET", "") or base64.b64encode(os.urandom(32)).decode()
-GATE_TTL = int(os.environ.get("GATE_TTL", "300"))
+
 
 # ===== 默认配置 =====
 DEFAULT_CONFIG = {
@@ -156,10 +156,22 @@ def normalize_config(data):
     cfg["wildcard"]["candidateCount"] = int(wc.get("candidateCount", cfg["wildcard"]["candidateCount"]) or cfg["wildcard"]["candidateCount"])
     cfg["wildcard"]["labelLength"] = int(wc.get("labelLength", cfg["wildcard"]["labelLength"]) or cfg["wildcard"]["labelLength"])
 
-    # probe
+    # probe — 自动纠正反斜杠为正斜杠，确保以 / 开头
     probe = src.get("probeAssets", cfg["probeAssets"]) or []
-    cfg["probeAssets"] = [str(p).strip() for p in probe if str(p).strip()]
-    cfg["probeAssetThreshold"] = int(src.get("probeAssetThreshold", cfg["probeAssetThreshold"]) or cfg["probeAssetThreshold"])
+    cleaned_probe = []
+    for p in probe:
+        s = str(p).strip().replace("\\", "/")
+        if s and not s.startswith("/"):
+            s = "/" + s
+        if s:
+            cleaned_probe.append(s)
+    cfg["probeAssets"] = cleaned_probe
+    raw_threshold = int(src.get("probeAssetThreshold", cfg["probeAssetThreshold"]) or cfg["probeAssetThreshold"])
+    # 自动钳位：阈值不能超过探测资源数量
+    if cleaned_probe:
+        cfg["probeAssetThreshold"] = max(1, min(raw_threshold, len(cleaned_probe)))
+    else:
+        cfg["probeAssetThreshold"] = raw_threshold
 
     # domains
     cfg["domains"] = src.get("domains", cfg["domains"]) or []
@@ -220,10 +232,25 @@ def generate_gate_token():
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
+def verify_gate_token(token_str):
+    try:
+        padding = 4 - len(token_str) % 4
+        if padding != 4:
+            token_str += "=" * padding
+        raw = base64.urlsafe_b64decode(token_str).decode()
+        ts_str, sig = raw.split(":", 1)
+        ts = int(ts_str)
+        if abs(time.time() - ts) > TOKEN_TTL:
+            return False
+        expected = hmac.new(GATE_SECRET.encode(), ts_str.encode(), hashlib.sha256).hexdigest()[:16]
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 # ================================================================
 #  Nginx Gate 配置生成
 # ================================================================
 def build_gate_nginx_config(config, site_type="php"):
+    """生成最小化 Gate 505 配置片段，直接粘贴到已有 server 块内。"""
     probe_assets = config.get("probeAssets", [])
     whitelist_dirs = set()
     whitelist_files = set()
@@ -236,80 +263,57 @@ def build_gate_nginx_config(config, site_type="php"):
             whitelist_files.add(cleaned)
 
     is_php = site_type == "php"
-    type_label = "PHP (ThinkPHP)" if is_php else "纯静态站"
 
     lines = [
-        "# ===== Nginx Gate 505 配置 =====",
-        f"# 站点类型: {type_label}",
-        f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# ===== Gate 505 配置片段 ({time.strftime('%Y-%m-%d %H:%M')}) =====",
+        "# 用法：删除原有的静态资源缓存规则（gif|jpg|…、js|css 那两段），粘贴以下内容",
         "",
-        "server {",
-        "    listen 8080;",
-        "    server_name _;",
+        "# === 探测资源放行 ===",
     ]
-    if is_php:
-        lines += ["    root /var/www/html/public;", "    index index.php index.html;"]
-    else:
-        lines += ["    root /usr/share/nginx/html;", "    index index.html;"]
-
-    lines += ["", "    absolute_redirect off;", "", "    # === 探测资源放行 ==="]
     for d in sorted(whitelist_dirs):
-        lines += [f"    location /{d}/ {{", "        expires 30d;", "        access_log off;", "    }", ""]
+        lines += [f"location /{d}/ {{", "    expires 30d;", "    access_log off;", "}", ""]
     for f in sorted(whitelist_files):
-        lines += [f"    location = /{f} {{ expires 30d; access_log off; }}"]
-    lines += ["    location /favicon.ico { access_log off; }", "    location /robots.txt  { access_log off; }", ""]
-
-    if is_php:
-        lines += [
-            "    # === WebSocket ===",
-            "    location /wss {",
-            "        proxy_pass http://127.0.0.1:7273;",
-            "        proxy_http_version 1.1;",
-            '        proxy_set_header Upgrade $http_upgrade;',
-            '        proxy_set_header Connection "Upgrade";',
-            "    }",
-            "",
-        ]
+        lines.append(f"location = /{f} {{ expires 30d; access_log off; }}")
+    lines += ["location /favicon.ico { access_log off; }", "location /robots.txt  { access_log off; }", ""]
 
     lines += [
-        "    # === Gate cookie ===",
-        "    location = /_internal_gate {",
-        "        internal;",
-        '        add_header Set-Cookie "_gate_pass=1; Path=/; Max-Age=86400; HttpOnly" always;',
-        "        return 302 /;",
-        "    }",
+        "# === Gate cookie ===",
+        "location = /_internal_gate {",
+        "    internal;",
+        '    add_header Set-Cookie "_gate_pass=1; Path=/; Max-Age=86400; HttpOnly" always;',
+        "    return 302 /;",
+        "}",
         "",
-        "    # === 主入口 ===",
-        "    location / {",
-        '        set $gate "deny";',
-        '        if ($cookie__gate_pass = "1") { set $gate "allow"; }',
-        '        if ($arg__gate)               { set $gate "new";   }',
-        '        if ($gate = "new")  { rewrite ^ /_internal_gate last; }',
-        '        if ($gate = "deny") { return 505; }',
+        "# === 主入口 ===",
+        "location / {",
+        '    set $gate "deny";',
+        '    if ($cookie__gate_pass = "1") { set $gate "allow"; }',
+        '    if ($arg__gate)               { set $gate "new";   }',
+        '    if ($gate = "new")  { rewrite ^ /_internal_gate last; }',
+        '    if ($gate = "deny") { return 505; }',
         "",
     ]
     if is_php:
         lines += [
-            "        if (!-e $request_filename) {",
-            "            rewrite ^(.*)$ /index.php?s=/$1 last;",
-            "        }",
+            "    if (!-e $request_filename) {",
+            "        rewrite ^(.*)$ /index.php?s=/$1 last;",
+            "    }",
         ]
     else:
-        lines.append("        try_files $uri $uri/ =404;")
-    lines.append("    }")
+        lines.append("    try_files $uri $uri/ =404;")
+    lines.append("}")
 
     if is_php:
         lines += [
             "",
-            "    # === PHP-FPM ===",
-            "    location ~ \\.php$ {",
-            "        fastcgi_pass 127.0.0.1:9000;",
-            "        fastcgi_index index.php;",
-            "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
-            "        include fastcgi_params;",
-            "    }",
+            "# === PHP-FPM ===",
+            "location ~ \\.php$ {",
+            "    fastcgi_pass 127.0.0.1:9000;",
+            "    fastcgi_index index.php;",
+            "    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
+            "    include fastcgi_params;",
+            "}",
         ]
-    lines.append("}")
     return "\n".join(lines)
 
 
